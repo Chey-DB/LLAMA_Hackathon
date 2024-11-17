@@ -1,9 +1,14 @@
-// src/components/InterviewInterface.tsx
 import React, { useState, useRef, useEffect } from "react";
 import { useTranscription } from "../hooks/useTranscription";
 
+interface AudioLevels {
+  db: number;
+  isSilent: boolean;
+}
+
 const InterviewInterface = () => {
   const [isRecording, setIsRecording] = useState(false);
+  const shouldCheck = useRef<boolean | null>(null);
   const [currentQuestion, setCurrentQuestion] = useState({
     id: 1,
     text: "Tell me about a challenging project you've worked on and how you handled it.",
@@ -13,30 +18,40 @@ const InterviewInterface = () => {
   const [isInterviewStarted, setIsInterviewStarted] = useState(false);
   const [hasWebcamPermission, setHasWebcamPermission] = useState(false);
   const [error, setError] = useState("");
-  const [debugInfo, setDebugInfo] = useState<string[]>([]);
-
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [recordingState, setRecordingState] = useState<
+    "idle" | "countdown" | "recording" | "processing"
+  >("idle");
+  const [audioLevels, setAudioLevels] = useState<AudioLevels>({
+    db: -Infinity,
+    isSilent: false,
+  });
+  const [silenceTimer, setSilenceTimer] = useState<number>(0);
+  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(
+    null
+  );
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const javascriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const silenceStartRef = useRef<number | null>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const SILENCE_THRESHOLD = -50; // Decibel threshold for silence
+  const SILENCE_DURATION = 2500; // Duration in milliseconds to consider as silence
 
   const transcriptionMutation = useTranscription();
-
-  const addDebugLog = (message: string) => {
-    console.log(message);
-    setDebugInfo((prev) => [
-      ...prev,
-      `${new Date().toISOString()}: ${message}`,
-    ]);
-  };
 
   useEffect(() => {
     let mounted = true;
 
     const initializeWebcam = async () => {
       try {
-        addDebugLog("Initializing webcam...");
+        console.log("Initializing webcam...");
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             width: { ideal: 1280 },
@@ -46,15 +61,10 @@ const InterviewInterface = () => {
           audio: true,
         });
 
-        addDebugLog("Got media stream");
-        addDebugLog(`Video tracks: ${stream.getVideoTracks().length}`);
-        addDebugLog(`Audio tracks: ${stream.getAudioTracks().length}`);
-
         if (mounted) {
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
             await videoRef.current.play();
-            addDebugLog("Video preview started");
           }
           streamRef.current = stream;
           setHasWebcamPermission(true);
@@ -62,9 +72,6 @@ const InterviewInterface = () => {
         }
       } catch (err) {
         console.error("Error accessing webcam:", err);
-        addDebugLog(
-          `Webcam error: ${err instanceof Error ? err.message : String(err)}`
-        );
         setHasWebcamPermission(false);
         setError(
           err instanceof Error
@@ -81,20 +88,99 @@ const InterviewInterface = () => {
     return () => {
       mounted = false;
       if (streamRef.current) {
-        addDebugLog("Cleaning up media stream");
         streamRef.current.getTracks().forEach((track) => track.stop());
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
+      if (javascriptNodeRef.current) {
+        javascriptNodeRef.current.disconnect();
       }
     };
   }, [isInterviewStarted]);
 
-  const handleStartRecording = () => {
+  const initializeAudioAnalysis = (stream: MediaStream) => {
+    try {
+      audioContextRef.current = new (window.AudioContext ||
+        (window as any).webkitAudioContext)();
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      const microphone =
+        audioContextRef.current.createMediaStreamSource(stream);
+      javascriptNodeRef.current = audioContextRef.current.createScriptProcessor(
+        2048,
+        1,
+        1
+      );
+
+      analyserRef.current.smoothingTimeConstant = 0.8;
+      analyserRef.current.fftSize = 1024;
+
+      microphone.connect(analyserRef.current);
+      analyserRef.current.connect(javascriptNodeRef.current);
+      javascriptNodeRef.current.connect(audioContextRef.current.destination);
+
+      javascriptNodeRef.current.onaudioprocess = () => {
+        if (!analyserRef.current) return;
+
+        const array = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(array);
+        const arraySum = array.reduce((a, value) => a + value, 0);
+        const average = arraySum / array.length;
+        const decibelLevel = 20 * Math.log10(average / 255);
+
+        const isSilent = decibelLevel < SILENCE_THRESHOLD;
+
+        setAudioLevels({
+          db: Number.isFinite(decibelLevel) ? decibelLevel : -Infinity,
+          isSilent,
+        });
+
+        if (isSilent) {
+          if (!silenceStartRef.current) {
+            silenceStartRef.current = performance.now();
+          } else {
+            const silenceDuration = performance.now() - silenceStartRef.current;
+            setSilenceTimer(Math.floor(silenceDuration));
+            if (silenceDuration > SILENCE_DURATION && shouldCheck.current) {
+              console.log(silenceDuration);
+              handleStopRecording();
+            }
+          }
+        } else {
+          silenceStartRef.current = null;
+          setSilenceTimer(0);
+        }
+      };
+
+      return true;
+    } catch (err) {
+      console.error("Failed to initialize audio analysis:", err);
+      return false;
+    }
+  };
+
+  const startRecordingProcess = async () => {
+    setRecordingStartTime(Date.now()); // Set the recording start time
+    setRecordingState("countdown");
+    setCountdown(3);
+    shouldCheck.current = true;
+
+    for (let i = 3; i > 0; i--) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      setCountdown(i - 1);
+    }
+
+    await handleStartRecording();
+    setRecordingState("recording");
+  };
+
+  const handleStartRecording = async () => {
     if (!streamRef.current) {
       setError("No active stream found");
       return;
     }
-
+    silenceStartRef.current = null;
     try {
-      addDebugLog("Starting recording...");
       chunksRef.current = [];
 
       const mediaRecorder = new MediaRecorder(streamRef.current, {
@@ -104,23 +190,17 @@ const InterviewInterface = () => {
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           chunksRef.current.push(event.data);
-          addDebugLog(`Received chunk: ${event.data.size} bytes`);
         }
       };
 
-      // Request data every second
+      initializeAudioAnalysis(streamRef.current);
       mediaRecorder.start(1000);
-      addDebugLog(`MediaRecorder started with state: ${mediaRecorder.state}`);
 
       mediaRecorderRef.current = mediaRecorder;
       setIsRecording(true);
       setError("");
     } catch (err) {
-      addDebugLog(
-        `Recording start error: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
+      console.error("Recording start error:", err);
       setError(
         "Failed to start recording: " +
           (err instanceof Error ? err.message : String(err))
@@ -130,51 +210,41 @@ const InterviewInterface = () => {
   };
 
   const handleStopRecording = async () => {
-    if (mediaRecorderRef.current && isRecording) {
-      addDebugLog("Stopping recording...");
-
+    if (mediaRecorderRef.current && recordingState !== "processing") {
+      setRecordingState("processing");
+      shouldCheck.current = false;
       try {
-        // Create a promise that resolves when we get the final chunk
         await new Promise<void>((resolve) => {
           if (mediaRecorderRef.current) {
-            mediaRecorderRef.current.onstop = () => {
-              addDebugLog("MediaRecorder stopped");
-              resolve();
-            };
+            mediaRecorderRef.current.onstop = () => resolve();
             mediaRecorderRef.current.stop();
           }
         });
 
         setIsRecording(false);
+        setRecordingStartTime(null); // Reset the start time
 
-        // Create and check video blob
         const videoBlob = new Blob(chunksRef.current, {
           type: "video/webm;codecs=vp8,opus",
         });
-
-        addDebugLog(`Final blob created. Size: ${videoBlob.size} bytes`);
-        addDebugLog(`Number of chunks: ${chunksRef.current.length}`);
 
         if (videoBlob.size === 0) {
           throw new Error("Recording is empty");
         }
 
-        // Create a debug video element
-        const url = URL.createObjectURL(videoBlob);
-        addDebugLog("Created blob URL for preview");
-
-        // Try transcription
         if (videoBlob.size > 0) {
-          addDebugLog("Starting transcription...");
           const result = await transcriptionMutation.mutateAsync(videoBlob);
-          addDebugLog(
-            `Transcription received: ${result.text.substring(0, 50)}...`
-          );
+          handleNextQuestion();
+          setRecordingState("idle");
         }
       } catch (err) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        addDebugLog(`Error in stop recording: ${errorMessage}`);
-        setError(`Failed to process recording: ${errorMessage}`);
+        console.error("Error in stop recording:", err);
+        setError(
+          `Failed to process recording: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        setRecordingState("idle");
       }
     }
   };
@@ -198,7 +268,6 @@ const InterviewInterface = () => {
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
       setUploadedCV(files[0]);
@@ -212,20 +281,73 @@ const InterviewInterface = () => {
     }
   };
 
-  const renderDebugPanel = () => (
-    <div className="fixed bottom-0 right-0 w-96 max-h-64 overflow-y-auto bg-black bg-opacity-80 text-white p-4 text-xs font-mono">
-      <h3 className="text-sm font-bold mb-2">Debug Log</h3>
-      {debugInfo.map((log, i) => (
-        <div key={i} className="mb-1">
-          {log}
+  const VolumeIndicator = () => {
+    const volumePercentage = Math.max(
+      0,
+      Math.min(100, (audioLevels.db + 100) * 2)
+    );
+
+    return (
+      <div className="flex items-center gap-2">
+        <span className="text-sm">Volume:</span>
+        <div className="w-32 h-2 bg-gray-200 rounded-full overflow-hidden">
+          <div
+            className={`h-full transition-all duration-100 ${
+              volumePercentage > 20 ? "bg-green-500" : "bg-red-500"
+            }`}
+            style={{ width: `${volumePercentage}%` }}
+          />
         </div>
-      ))}
-    </div>
-  );
+        <span className="text-xs">{volumePercentage.toFixed(1)}%</span>
+        {audioLevels.isSilent && (
+          <span className="text-xs text-red-500">
+            {silenceTimer > 0
+              ? `Silent: ${(silenceTimer / 1000).toFixed(1)}s`
+              : "Silent"}
+          </span>
+        )}
+      </div>
+    );
+  };
+
+  const renderRecordingStatus = () => {
+    switch (recordingState) {
+      case "countdown":
+        return (
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50">
+            <div className="text-white text-6xl font-bold">
+              {countdown === 0 ? "Go!" : countdown}
+            </div>
+          </div>
+        );
+      case "recording":
+        return (
+          <div className="absolute top-4 right-4 flex flex-col gap-2 bg-gray-800 p-4 rounded-lg text-white">
+            <div className="flex items-center gap-2">
+              <div className="h-3 w-3 bg-red-500 rounded-full animate-pulse" />
+              <span>Recording...</span>
+            </div>
+            <VolumeIndicator />
+          </div>
+        );
+      case "processing":
+        return (
+          <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50">
+            <div className="text-white text-xl">
+              Processing your response...
+              <div className="mt-4 h-2 w-32 bg-gray-200 rounded-full overflow-hidden">
+                <div className="h-full bg-blue-600 animate-progress" />
+              </div>
+            </div>
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {renderDebugPanel()}
       {!isInterviewStarted ? (
         <div className="p-8">
           <div className="max-w-2xl mx-auto bg-white rounded-lg border shadow-sm">
@@ -284,7 +406,6 @@ const InterviewInterface = () => {
         </div>
       ) : (
         <div className="flex min-h-screen">
-          {/* Question Panel - Left Side */}
           <div className="w-1/3 min-h-screen bg-white border-r border-gray-200 flex flex-col">
             <div className="p-6 flex-1 overflow-y-auto">
               <div className="mb-8">
@@ -294,48 +415,26 @@ const InterviewInterface = () => {
                 <p className="text-lg mb-6">{currentQuestion.text}</p>
                 <div className="space-y-4">
                   <p className="text-sm text-gray-600">
-                    Take your time to think about your answer. Click record when
-                    you're ready.
+                    Click start when you're ready to answer.
                   </p>
                   {error && <p className="text-red-500 text-sm">{error}</p>}
                   <div className="flex gap-4">
-                    {!isRecording ? (
+                    {recordingState === "idle" && (
                       <button
-                        onClick={handleStartRecording}
+                        onClick={startRecordingProcess}
                         disabled={!hasWebcamPermission}
-                        className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-md hover:bg-red-700 transition-colors disabled:opacity-50"
+                        className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50"
                       >
                         <span>🎥</span>
-                        Start Recording
-                      </button>
-                    ) : (
-                      <button
-                        onClick={handleStopRecording}
-                        className="flex items-center gap-2 bg-gray-600 text-white px-4 py-2 rounded-md hover:bg-gray-700 transition-colors"
-                      >
-                        <span>⬛</span>
-                        Stop Recording
+                        Start
                       </button>
                     )}
                   </div>
                 </div>
               </div>
             </div>
-
-            {!isRecording && hasWebcamPermission && (
-              <div className="p-6 border-t border-gray-200">
-                <button
-                  onClick={handleNextQuestion}
-                  className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors"
-                >
-                  <span>➡️</span>
-                  Submit and Continue
-                </button>
-              </div>
-            )}
           </div>
 
-          {/* Video Preview Panel - Right Side */}
           <div className="w-2/3 min-h-screen bg-gray-900 flex flex-col">
             <div className="flex-1 relative">
               <video
@@ -358,15 +457,17 @@ const InterviewInterface = () => {
                   )}
                 </div>
               )}
+              {renderRecordingStatus()}
             </div>
 
-            {/* Video Controls Overlay */}
             <div className="bg-gray-800 text-white p-4">
               <div className="flex justify-between items-center max-w-4xl mx-auto">
                 <div className="flex items-center gap-4">
                   <div className="flex items-center gap-2">
                     <span>🎤</span>
-                    <span className="text-sm">Audio Level: Active</span>
+                    <span className="text-sm">
+                      Audio Level: {audioLevels.isSilent ? "Silent" : "Active"}
+                    </span>
                   </div>
                 </div>
                 {isRecording && (
