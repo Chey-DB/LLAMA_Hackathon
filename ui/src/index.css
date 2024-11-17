@@ -77,3 +77,15 @@
     @apply text-black; /* Replace with your desired utility */
   }
 }
+@keyframes progress {
+  0% {
+    width: 0%;
+  }
+  100% {
+    width: 100%;
+  }
+}
+
+.animate-progress {
+  animation: progress 2s linear infinite;
+}
