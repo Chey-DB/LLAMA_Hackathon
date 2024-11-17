@@ -10,9 +10,11 @@ const InterviewInterface = () => {
   const [isRecording, setIsRecording] = useState(false);
   const shouldCheck = useRef<boolean | null>(null);
   const [currentQuestion, setCurrentQuestion] = useState({
-    id: 1,
-    text: "Tell me about a challenging project you've worked on and how you handled it.",
+    id: 0,
+    text: "No questions loaded yet.",
   });
+
+  const [technicalQuestions, setTechnicalQuestions] = useState<string[]>([]);
   const [uploadedCV, setUploadedCV] = useState<File | null>(null);
   const [jobLink, setJobLink] = useState("");
   const [isInterviewStarted, setIsInterviewStarted] = useState(false);
@@ -45,6 +47,14 @@ const InterviewInterface = () => {
   const SILENCE_DURATION = 2500; // Duration in milliseconds to consider as silence
 
   const transcriptionMutation = useTranscription();
+  useEffect(() => {
+    if (technicalQuestions && technicalQuestions.length > 0) {
+      setCurrentQuestion({
+        id: 1,
+        text: technicalQuestions[0],
+      });
+    }
+  }, [technicalQuestions]);
 
   useEffect(() => {
     let mounted = true;
@@ -249,13 +259,26 @@ const InterviewInterface = () => {
     }
   };
 
-  const handleNextQuestion = () => {
-    setCurrentQuestion((prev) => ({
-      id: prev.id + 1,
-      text: "How do you handle difficult situations in a team environment?",
-    }));
+  const startInterview = async () => {
+    setError("");
+    if (!jobLink) {
+      setError("Please provide a valid job description link.");
+      return;
+    }
+
+    await fetchTechnicalQuestions(jobLink);
+    setIsInterviewStarted(true);
   };
 
+  const handleNextQuestion = () => {
+    setCurrentQuestion((prev) => {
+      const nextId = prev.id + 1;
+      // Adjust array index to be zero-based
+      const nextText =
+        technicalQuestions[nextId - 1] || "No more questions available.";
+      return { id: nextId, text: nextText };
+    });
+  };
   const handleFileUploadClick = () => {
     fileInputRef.current?.click();
   };
@@ -281,6 +304,27 @@ const InterviewInterface = () => {
     }
   };
 
+  const fetchTechnicalQuestions = async (jobLink: string) => {
+    try {
+      const response = await fetch(
+        `http://localhost:8000/questions/technical?url=${encodeURIComponent(
+          jobLink
+        )}`
+      );
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      console.log("API Response:", data); // Keep debug log from working version
+      setTechnicalQuestions(data.technical_questions || []);
+    } catch (err) {
+      console.error("Full error:", err); // Match debug component error logging
+      setError(
+        `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+      setTechnicalQuestions([]); // Clear questions on error
+    }
+  };
   const VolumeIndicator = () => {
     const volumePercentage = Math.max(
       0,
@@ -395,7 +439,7 @@ const InterviewInterface = () => {
               </div>
 
               <button
-                onClick={() => setIsInterviewStarted(true)}
+                onClick={startInterview}
                 className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 disabled={!uploadedCV || !jobLink}
               >
